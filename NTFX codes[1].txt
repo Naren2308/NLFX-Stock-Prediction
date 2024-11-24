@@ -1,0 +1,407 @@
+from flask import Flask, render_template, request, send_from_directory
+import os
+import datetime
+import pandas as pd
+import numpy as np
+import joblib
+from tensorflow.keras.models import load_model
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+app = Flask(__name__)
+app.config['PREDICTIONS_FOLDER'] = 'static/predictions'
+
+# Load model and scaler
+model = load_model('lstm_model.h5')
+scaler = joblib.load('scaler.pkl')
+
+# Load and preprocess the dataset
+data = pd.read_csv('NFLX_dataset.csv')
+data['Date'] = pd.to_datetime(data['Date'])
+data.set_index('Date', inplace=True)
+data = data[['Close']]
+
+# Feature Engineering (same as during training)
+data['5_MA'] = data['Close'].rolling(window=5).mean()
+data['30_MA'] = data['Close'].rolling(window=30).mean()
+data['Volatility'] = data['Close'].rolling(window=5).std()
+data['Returns'] = data['Close'].pct_change()
+data.dropna(inplace=True)
+
+# Scale the data with all features
+data_scaled = scaler.transform(data[['Close', '5_MA', '30_MA', 'Volatility', 'Returns']])
+
+# Prediction function
+def predict_custom_dates(custom_dates):
+    custom_dates = [datetime.datetime.strptime(date, '%d-%m-%Y') for date in custom_dates]
+    last_lookback_data = data_scaled[-120:]  # Lookback of 120 days
+    last_input = np.array([last_lookback_data])
+
+    custom_predictions = []
+    for _ in custom_dates:
+        prediction = model.predict(last_input)
+        custom_predictions.append(prediction[0, 0])
+        prediction_padded = np.concatenate((prediction, np.zeros((1, 4))), axis=1)
+        prediction_reshaped = prediction_padded.reshape(1, 1, 5)
+        last_input = np.concatenate([last_input[:, 1:, :], prediction_reshaped], axis=1)
+
+    custom_predictions = np.array(custom_predictions).reshape(-1, 1)
+    custom_predictions = scaler.inverse_transform(
+        np.concatenate((custom_predictions, np.zeros((custom_predictions.shape[0], 4))), axis=1)
+    )[:, 0]
+    return custom_dates, custom_predictions
+
+# Save prediction image
+def save_prediction_image(predicted_dates, predicted_prices):
+    if not os.path.exists(app.config['PREDICTIONS_FOLDER']):
+        os.makedirs(app.config['PREDICTIONS_FOLDER'])
+
+    timestamp = datetime.datetime.now().strftime("%d%m%Y_%H%M%S")
+    prediction_filename = f"prediction_{timestamp}.png"
+    filepath = os.path.join(app.config['PREDICTIONS_FOLDER'], prediction_filename)
+
+    plt.figure(figsize=(14, 8))
+    last_month_data = data[-120:]  # Show the last 120 days on the chart
+    last_month_actual = scaler.inverse_transform(data_scaled[-120:, :])[:, 0]
+    plt.plot(last_month_data.index, last_month_actual, color='blue', linewidth=1.5, label='Actual Price (Last 120 Days)')
+    plt.plot(predicted_dates, predicted_prices, color='purple', linestyle='-.', marker='o', markersize=6, linewidth=2, label='Forecasted Custom Dates')
+    plt.title('Netflix Stock Price Prediction', fontsize=16, weight='bold')
+    plt.xlabel('Date', fontsize=14)
+    plt.ylabel('Stock Price (USD)', fontsize=14)
+    plt.grid(visible=True, linestyle='--', alpha=0.6)
+    plt.legend(loc='upper left', fontsize=12)
+    plt.gca().xaxis.set_major_locator(mdates.DayLocator(interval=5))
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %d, %Y'))
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(filepath)
+    plt.close()
+
+    return prediction_filename
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    # Analyze the last 120 days
+    last_120_days_data = data[-120:]
+    first_price = last_120_days_data['Close'].iloc[0]
+    last_price = last_120_days_data['Close'].iloc[-1]
+    price_change = last_price - first_price
+    percentage_change = (price_change / first_price) * 100
+
+    insights = {
+        'first_price': round(first_price, 2),
+        'last_price': round(last_price, 2),
+        'price_change': round(price_change, 2),
+        'percentage_change': round(percentage_change, 2),
+        'trend': "rose" if price_change > 0 else "fell"
+    }
+
+    if request.method == 'POST':
+        date_input = request.form.get('dates')
+        custom_dates = [date.strip() for date in date_input.split(",")]
+
+        # Generate predictions
+        predicted_dates, predicted_prices = predict_custom_dates(custom_dates)
+
+        # Calculate price changes
+        price_changes = [0]  # First entry has no previous price to compare
+        for i in range(1, len(predicted_prices)):
+            change = predicted_prices[i] - predicted_prices[i - 1]
+            price_changes.append(change)
+
+        # Format dates and combine them with prices and changes
+        formatted_dates = [date.strftime('%d-%m-%Y') for date in predicted_dates]
+        predictions = list(zip(formatted_dates, predicted_prices, price_changes))
+
+        # Save the prediction image and get the filename
+        image_url = save_prediction_image(predicted_dates, predicted_prices)
+
+        # Pass the filename and predictions to be displayed on the front end
+        return render_template('index.html', image_url=image_url, predictions=predictions, insights=insights)
+
+    return render_template('index.html', image_url=None, insights=insights)
+
+# Serve prediction images
+@app.route('/static/predictions/<filename>')
+def display_image(filename):
+    return send_from_directory(app.config['PREDICTIONS_FOLDER'], filename)
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
+
+
+
+index.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stock Price Prediction</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bulma/0.9.3/css/bulma.min.css">
+</head>
+<body>
+    <section class="section">
+        <div class="container">
+            <h1 class="title">Netflix Stock Price Prediction</h1>
+
+            <!-- Prediction Form -->
+            <p>Enter custom dates (format: DD-MM-YYYY) separated by commas to predict stock prices.</p>
+            <form action="/" method="POST">
+                <div class="field">
+                    <label class="label">Prediction Dates</label>
+                    <div class="control">
+                        <input class="input" type="text" name="dates" placeholder="e.g., 20-11-2024, 25-12-2024" required>
+                    </div>
+                </div>
+                <div class="control">
+                    <button type="submit" class="button is-link">Predict</button>
+                </div>
+            </form>
+
+            <!-- Prediction Results -->
+            {% if image_url %}
+            <div class="section">
+                <h2 class="subtitle">Prediction Results</h2>
+                <img src="{{ url_for('display_image', filename=image_url) }}" alt="Prediction Result">
+                
+                <table class="table is-striped is-fullwidth">
+                    <thead>
+                        <tr>
+                            <th>Date</th>
+                            <th>Predicted Price (USD)</th>
+                            <th>Change</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for date, price, change in predictions %}
+                        <tr>
+                            <td>{{ date }}</td>
+                            <td>${{ "%.2f"|format(price) }}</td>
+                            <td>
+                                {% if change > 0 %}
+                                    <span style="color: green;">+${{ "%.2f"|format(change) }}</span>
+                                {% elif change < 0 %}
+                                    <span style="color: red;">-${{ "%.2f"|format(-change) }}</span>
+                                {% else %}
+                                    $0.00
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+        </div>
+            <!-- Last 120 Days Analysis -->
+            <div class="section">
+                <h2 class="subtitle">Last 120 Days Analysis</h2>
+                <table class="table is-striped is-fullwidth">
+                    <thead>
+                        <tr>
+                            <th>Date</th>
+                            <th>Closing Price (USD)</th>
+                            <th>Change</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for date, price, change in last_sixty_days %}
+                        <tr>
+                            <td>{{ date }}</td>
+                            <td>${{ "%.2f"|format(price) }}</td>
+                            <td>
+                                {% if change > 0 %}
+                                    <span style="color: green;">+${{ "%.2f"|format(change) }}</span>
+                                {% elif change < 0 %}
+                                    <span style="color: red;">-${{ "%.2f"|format(-change) }}</span>
+                                {% else %}
+                                    $0.00
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>        
+    </section>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import pandas as pd
+import numpy as np
+import joblib
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import datetime
+
+# Load the dataset
+data = pd.read_csv('/content/NFLX_dataset.csv')
+
+# Data Preprocessing
+data['Date'] = pd.to_datetime(data['Date'])
+data.set_index('Date', inplace=True)
+
+# Feature Selection
+data = data[['Close']]
+
+# Feature Engineering
+data['5_MA'] = data['Close'].rolling(window=5).mean()  # 5-day moving average
+data['30_MA'] = data['Close'].rolling(window=30).mean()  # 30-day moving average
+data['Volatility'] = data['Close'].rolling(window=5).std()  # 5-day volatility
+data['Returns'] = data['Close'].pct_change()  # Daily returns
+
+# Drop NA values created by rolling calculations
+data.dropna(inplace=True)
+
+# Scale the data (normalization)
+scaler = MinMaxScaler(feature_range=(0, 1))
+data_scaled = scaler.fit_transform(data)
+
+# Train-test Split
+train_size = int(len(data_scaled) * 0.8)  # 80% for training, 20% for testing
+train_data = data_scaled[:train_size]
+test_data = data_scaled[train_size:]
+
+# Prepare training data
+lookback = 120
+X_train, y_train = [], []
+X_test, y_test = [], []
+
+# Create the training dataset
+for i in range(lookback, len(train_data)):
+    X_train.append(train_data[i-lookback:i])
+    y_train.append(train_data[i, 0])
+
+# Create the testing dataset
+for i in range(lookback, len(test_data)):
+    X_test.append(test_data[i-lookback:i])
+    y_test.append(test_data[i, 0])
+
+# Convert lists to numpy arrays
+X_train, y_train = np.array(X_train), np.array(y_train)
+X_test, y_test = np.array(X_test), np.array(y_test)
+
+# LSTM Model
+model = Sequential([
+    LSTM(60, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+    Dropout(0.2),
+    LSTM(60, return_sequences=False),
+    Dropout(0.2),
+    Dense(1)
+])
+
+# Compile the model
+model.compile(optimizer='adam', loss='mean_squared_error')
+model.fit(X_train, y_train, epochs=50, batch_size=32)
+
+# Custom Date Prediction Function
+def predict_custom_dates(custom_dates):
+    custom_dates_datetime = []
+    for date in custom_dates:
+        try:
+            # Attempt to convert the date string to a datetime object
+            custom_dates_datetime.append(datetime.datetime.strptime(date, '%d-%m-%Y'))
+        except ValueError:
+            # Handle invalid dates (e.g., February 30th)
+            print(f"Invalid date: {date}. Skipping this date.")
+
+    # If no valid dates remain, return early
+    if not custom_dates_datetime:
+        print("No valid dates provided. Exiting.")
+        return [], []
+
+    custom_dates = custom_dates_datetime
+    last_lookback_data = data_scaled[-lookback:]
+    last_input = np.array([last_lookback_data])
+
+    custom_predictions = []
+    for _ in custom_dates:
+        prediction = model.predict(last_input)
+        custom_predictions.append(prediction[0, 0])
+        # Fix: Reshape the prediction and pad with zeros
+        prediction_padded = np.concatenate((prediction, np.zeros((1, 4))), axis=1)
+        # Reshape to match the input shape of the LSTM
+        prediction_reshaped = prediction_padded.reshape(1, 1, 5)
+        last_input = np.concatenate([last_input[:, 1:, :], prediction_reshaped], axis=1)
+
+    custom_predictions = np.array(custom_predictions).reshape(-1, 1)
+    custom_predictions = scaler.inverse_transform(np.concatenate((custom_predictions, np.zeros((custom_predictions.shape[0], 4))), axis=1))[:, 0]
+
+    return custom_dates, custom_predictions
+
+# Predict for Custom Dates
+custom_dates = ['2024-12-01', '2024-12-25', '2024-01-10', '2024-02-15', '2024-02-30']  # Example with invalid date
+predicted_dates, predicted_prices = predict_custom_dates(custom_dates)
+
+# Calculate price changes for each prediction
+last_actual_price = data['Close'].iloc[-1]
+price_changes = predicted_prices - last_actual_price
+percentage_changes = (price_changes / last_actual_price) * 100
+
+# Display prediction outcomes with changes
+print("\nPredicted Prices and Changes for Custom Dates:")
+for date, price, change, pct_change in zip(predicted_dates, predicted_prices, price_changes, percentage_changes):
+    print(f"Date: {date.strftime('%d-%m-%Y')}, Predicted Price: ${price:.2f}, "
+          f"Change: ${change:.2f} ({pct_change:.2f}%)")
+
+# Plotting Last Month and Custom Predictions
+plt.figure(figsize=(14, 8))
+
+# Last month of actual data
+last_month_data = data[-120:]
+last_month_actual = scaler.inverse_transform(data_scaled[-120:, :])[:, 0]
+plt.plot(last_month_data.index, last_month_actual, color='blue', linewidth=1.5, label='Actual Price (Last Month)')
+
+# Plot predictions for custom dates
+plt.plot(predicted_dates, predicted_prices, color='purple', linestyle='-.', marker='o', markersize=6, linewidth=2, label='Forecasted Custom Dates')
+
+# Customizing plot for clarity
+plt.title('Netflix Stock Price Prediction', fontsize=16, weight='bold')
+plt.xlabel('Date', fontsize=14)
+plt.ylabel('Stock Price (USD)', fontsize=14)
+plt.grid(visible=True, linestyle='--', alpha=0.6)
+plt.legend(loc='upper left', fontsize=12)
+
+# Formatting the x-axis for readability
+plt.gca().xaxis.set_major_locator(mdates.DayLocator(interval=5))
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %d, %Y'))
+plt.xticks(rotation=45)
+
+plt.tight_layout()
+plt.show()
+
+# Save Model and Scaler
+joblib.dump(scaler, 'scaler.pkl')
+model.save('lstm_model.h5')
+
+
+
+
+
+Predicted Prices and Changes for Custom Dates:
+Date: 2024-12-01, Predicted Price: $705.00, Change: $-51.10 (-6.76%)
+Date: 2024-12-25, Predicted Price: $649.09, Change: $-107.01 (-14.15%)
+Date: 2024-01-10, Predicted Price: $576.08, Change: $-180.02 (-23.81%)
+Date: 2024-02-15, Predicted Price: $504.81, Change: $-251.29 (-33.23%)

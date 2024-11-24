@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Prediction Results</title>
+</head>
+<body>
+    <h1>Stock Price Prediction</h1>
+    <h2>Predicted Stock Prices for the Next 180 Days</h2>
+    <img src="{{ plot_path }}" alt="Predicted Prices">
+    
+    <h3>Price Change Overview:</h3>
+    <ul>
+        {% for date, change in zip(future_dates, price_changes) %}
+        <li>{{ date }}: {{ change[0] }}</li>
+        {% endfor %}
+    </ul>
+
+    <h3>Historical Data (Last 120 Days):</h3>
+    {{ historical_data|safe }}
+</body>
+</html>
