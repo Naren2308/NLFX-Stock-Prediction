@@ -1,3 +1,6 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  
+
 from flask import Flask, render_template, request, send_from_directory
 import os
 import datetime
@@ -17,7 +20,7 @@ scaler = joblib.load('scaler.pkl')
 
 # Load and preprocess the dataset
 data = pd.read_csv('NFLX_dataset.csv')
-data['Date'] = pd.to_datetime(data['Date'])
+data['Date'] = pd.to_datetime(data['Date'], dayfirst=True)
 data.set_index('Date', inplace=True)
 data = data[['Close']]
 
@@ -142,4 +145,4 @@ def display_image(filename):
     return send_from_directory(app.config['PREDICTIONS_FOLDER'], filename)
 
 if __name__ == '__main__':
-    app.run(debug=False,host='0.0.0.0')
+        app.run(debug=True)
